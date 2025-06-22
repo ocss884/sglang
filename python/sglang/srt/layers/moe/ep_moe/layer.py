@@ -1,5 +1,5 @@
 import logging
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple, Union
 
 import einops
 import torch
@@ -966,11 +966,11 @@ class DeepEPMoE(EPMoE):
         self.w13_weight_flatten = self.w13_weight.view(-1, self.w13_weight.shape[-1])
         self.w2_weight_flatten = self.w2_weight.view(-1, self.w2_weight.shape[-1])
         # TODO: num_max_dispatch_tokens_per_rank = 128, make it configurable
-        self.intermidiate_cache_1 = torch.empty((128 * num_experts, hidden_size), dtype=torch.bfloat16, device=self.w13_weight.device)
+        self.intermediate_cache = torch.empty((128 * num_experts, hidden_size), dtype=torch.bfloat16, device=self.w13_weight.device)
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         reorder_topk_ids: torch.Tensor,
@@ -982,17 +982,24 @@ class DeepEPMoE(EPMoE):
     ):
         resolved_deepep_mode = self.deepep_mode.resolve(forward_mode)
         if resolved_deepep_mode == DeepEPMode.normal:
-            if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+            if isinstance(hidden_states, Tuple[torch.Tensor, torch.Tensor]):
+                assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
                 return self.forward_deepgemm_contiguous(
                     hidden_states, topk_idx, topk_weights, num_recv_tokens_per_expert
                 )
-            else:
+            elif isinstance(hidden_states, torch.Tensor):
                 return self.forward_normal(hidden_states, reorder_topk_ids, seg_indptr)
+            else:
+                raise ValueError(f"Invalid hidden_states type: {type(hidden_states)} in normal mode")
         elif resolved_deepep_mode == DeepEPMode.low_latency:
-            if hidden_states[0].dtype == torch.bfloat16:
+            if isinstance(hidden_states, Tuple[torch.Tensor, torch.Tensor]):
+                assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                return self.forward_deepgemm_masked(hidden_states, masked_m, expected_m)
+            elif isinstance(hidden_states, torch.Tensor):
                 assert self.use_fb_grouped_gemm
-                return self.forward_deepgemm_masked_bf16(hidden_states, masked_m, expected_m)
-            return self.forward_deepgemm_masked(hidden_states, masked_m, expected_m)
+                return self.forward_bf16_masked(hidden_states, masked_m, expected_m)
+            else:
+                raise ValueError(f"Invalid hidden_states type: {type(hidden_states)} in low latency mode")
         else:
             raise ValueError(f"Invalid deepep_mode: {self.deepep_mode}")
 
@@ -1305,7 +1312,7 @@ class DeepEPMoE(EPMoE):
 
         return down_output
     
-    def forward_deepgemm_masked_bf16(
+    def forward_bf16_masked(
         self,
         hidden_states: torch.Tensor,
         masked_m: torch.Tensor,
@@ -1318,7 +1325,7 @@ class DeepEPMoE(EPMoE):
         n = self.w13_weight.shape[1]
 
         # GroupGemm-0
-        hidden_states = run_fbgemm_preprocess(hidden_states, masked_m, self.intermidiate_cache_1)        
+        hidden_states = run_fbgemm_preprocess(hidden_states, masked_m, self.intermediate_cache)        
         gate_output = fb_grouped_gemm(hidden_states, self.w13_weight_flatten, masked_m)
 
         dispose_tensor(hidden_states)
@@ -1337,7 +1344,7 @@ class DeepEPMoE(EPMoE):
 
         # GroupGemm-1
         down_output = fb_grouped_gemm(down_input, self.w2_weight_flatten, masked_m)
-        down_output = run_fbgemm_postprocess(down_output, masked_m, m, self.intermidiate_cache_1)
+        down_output = run_fbgemm_postprocess(down_output, masked_m, m, self.intermediate_cache)
         assert down_output.shape == torch.Size([num_groups, m, k])
 
         return down_output
