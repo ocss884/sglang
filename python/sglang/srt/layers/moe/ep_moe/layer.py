@@ -22,10 +22,25 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     silu_and_mul_masked_post_quant_fwd,
     silu_and_mul_masked_fwd,
     silu_and_mul_triton_kernel,
-    run_fbgemm_preprocess,
-    run_fbgemm_postprocess,
     tma_align_input_scale,
+    try_import_fbgemm_gpu,
 )
+
+_use_fbgemm_gpu = try_import_fbgemm_gpu()
+if _use_fbgemm_gpu:
+    logger.info(f"fbgemm_gpu is enabled, use forward_bf16_masked_v2")
+    from sglang.srt.layers.moe.ep_moe.kernels import (
+        compute_indices,
+        run_fbgemm_preprocess_v2,
+        run_fbgemm_postprocess_v2,
+    )
+else:
+    logger.info(f"fbgemm_gpu is disabled, use forward_bf16_masked_v1")
+    from sglang.srt.layers.moe.ep_moe.kernels import (
+        run_fbgemm_preprocess,
+        run_fbgemm_postprocess,
+    )
+
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE, FusedMoEMethodBase
 from sglang.srt.layers.moe.topk import select_experts
@@ -966,7 +981,7 @@ class DeepEPMoE(EPMoE):
         self.w13_weight_flatten = self.w13_weight.view(-1, self.w13_weight.shape[-1])
         self.w2_weight_flatten = self.w2_weight.view(-1, self.w2_weight.shape[-1])
         # TODO: num_max_dispatch_tokens_per_rank = 128, make it configurable
-        self.intermediate_cache = torch.empty((128 * num_experts, hidden_size), dtype=torch.bfloat16, device=self.w13_weight.device)
+        self.intermediate_cache = torch.empty((128 * num_experts, hidden_size), dtype=torch.bfloat16, device=self.w13_weight.device) if _use_fbgemm_gpu else None
 
     def forward(
         self,
@@ -997,7 +1012,10 @@ class DeepEPMoE(EPMoE):
                 return self.forward_deepgemm_masked(hidden_states, masked_m, expected_m)
             elif isinstance(hidden_states, torch.Tensor):
                 assert self.use_fb_grouped_gemm
-                return self.forward_bf16_masked(hidden_states, masked_m, expected_m)
+                if _use_fbgemm_gpu:
+                    return self.forward_bf16_masked_v2(hidden_states, masked_m, expected_m)
+                else:
+                    return self.forward_bf16_masked_v1(hidden_states, masked_m, expected_m)
             else:
                 raise ValueError(f"Invalid hidden_states type: {type(hidden_states)} in low latency mode")
         else:
@@ -1312,7 +1330,7 @@ class DeepEPMoE(EPMoE):
 
         return down_output
     
-    def forward_bf16_masked(
+    def forward_bf16_masked_v1(
         self,
         hidden_states: torch.Tensor,
         masked_m: torch.Tensor,
@@ -1348,6 +1366,46 @@ class DeepEPMoE(EPMoE):
         assert down_output.shape == torch.Size([num_groups, m, k])
 
         return down_output
+
+    def forward_bf16_masked_v2(
+        self,
+        hidden_states: torch.Tensor,
+        masked_m: torch.Tensor,
+        expected_m: int,
+    ):
+        assert self.quant_method is not None
+        assert self.activation == "silu"
+
+        num_groups, m, k = hidden_states.size()
+        n = self.w13_weight.shape[1]
+
+        indices = compute_indices(num_groups, m, masked_m)
+
+        # GroupGemm-0
+        dense_hidden_states = run_fbgemm_preprocess_v2(hidden_states, indices)   
+        gate_output = fb_grouped_gemm(dense_hidden_states, self.w13_weight_flatten, masked_m)
+
+        dispose_tensor(dense_hidden_states)
+
+        # Silu and mul
+        down_input = torch.empty(
+            (
+                gate_output.shape[0],
+                gate_output.shape[1] // 2,
+            ),
+            device=gate_output.device,
+            dtype=torch.bfloat16,
+        )
+        silu_and_mul_masked_fwd(gate_output, down_input, masked_m)
+        del gate_output
+
+        # GroupGemm-1
+        down_output = fb_grouped_gemm(down_input, self.w2_weight_flatten, masked_m)
+        output = torch.zeros_like(hidden_states)
+        run_fbgemm_postprocess_v2(down_output, indices, output, masked_m)
+        assert output.shape == torch.Size([num_groups, m, k])
+
+        return output
 
 def get_moe_impl_class():
     if global_server_args_dict["enable_deepep_moe"]:

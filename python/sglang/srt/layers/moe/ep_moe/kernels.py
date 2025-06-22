@@ -1193,6 +1193,14 @@ def tma_align_input_scale(input_scale: torch.Tensor):
     return output.t()[:m]
 
 
+def try_import_fbgemm_gpu():
+    try:
+        import fbgemm_gpu
+    except ImportError:
+        logger.info(f"fbgemm_gpu is not installed")
+        return False
+    return True
+
 @triton.jit
 def fbgemm_preprocess_kernel(
     lhs_ptr, m_sizes_ptr, offsets_ptr, output_ptr,
@@ -1309,3 +1317,81 @@ def run_fbgemm_postprocess(lhs, m_sizes, m_max, output):
     )
 
     return output
+
+@triton.jit
+def _compute_indices_kernel(
+    m_sizes,
+    offsets,
+    indices,
+    num_groups: tl.constexpr,
+    m_max: tl.constexpr,
+):
+    group_id = tl.program_id(0)
+
+    if group_id >= num_groups:
+        return
+
+    m_size = tl.load(m_sizes + group_id)
+    offset = tl.load(offsets + group_id)
+    
+    # indices[offset + i] = group_id * m_max + i, 0 <= i < m_size
+
+    for i in range(m_size):
+        tl.store(indices + offset + i, group_id * m_max + i)
+
+
+def compute_indices(num_groups, m_max, m_sizes: torch.Tensor):
+    offsets = torch.zeros_like(m_sizes, device=m_sizes.device)
+    offsets[1:] = torch.cumsum(m_sizes[:-1], dim=0)
+    indices = torch.zeros(num_groups * m_max, device=m_sizes.device, dtype=torch.int64)
+    grid = (num_groups,)
+
+    _compute_indices_kernel[grid](
+        m_sizes,
+        offsets,
+        indices,
+        num_groups=num_groups,
+        m_max=m_max,
+    )
+    return indices
+
+def run_fbgemm_preprocess_v2(lhs: torch.Tensor, indices: torch.Tensor):
+    """
+    Args:
+        lhs: [num_groups, m_max, k], float32
+        indices: [total_m], int64
+
+    Returns:
+        output: [total_m, k], same dtype as lhs
+    """
+    num_groups, m_max, k = lhs.shape
+
+    lhs = lhs.view(num_groups * m_max, k)
+
+    assert lhs.is_cuda, f"lhs not on CUDA: {lhs.device}"
+    assert indices.is_cuda, f"indices not on CUDA: {indices.device}"
+    assert lhs.is_contiguous(), "lhs not contiguous"
+    assert indices.is_contiguous(), "indices not contiguous"
+
+    output = torch.ops.fbgemm.gather_along_first_dim(lhs, indices)
+    
+    return output
+
+
+def run_fbgemm_postprocess_v2(lhs: torch.Tensor, indices: torch.Tensor, output: torch.Tensor, m_sizes: torch.Tensor):
+    """
+    Args:
+        output: [total_m, k]
+        indices: [total_m], int64
+        output: [num_groups, m_max, k]
+    """
+
+    num_groups, m_max, k = output.shape
+    output = output.view(num_groups * m_max, k)
+
+    indices = indices[:m_sizes.sum()]
+    lhs = lhs[:m_sizes.sum()]
+
+    torch.ops.fbgemm.scatter_add_along_first_dim(output, lhs, indices)
+
+    output = output.view(num_groups, m_max, k)
