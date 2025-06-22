@@ -975,7 +975,7 @@ class DeepEPMoE(EPMoE):
         self.use_fb_grouped_gemm = use_fb_grouped_gemm
         self.w13_weight_flatten = self.w13_weight.view(-1, self.w13_weight.shape[-1])
         self.w2_weight_flatten = self.w2_weight.view(-1, self.w2_weight.shape[-1])
-        
+
         # TODO: num_max_dispatch_tokens_per_rank = 128, make it configurable
         self.intermediate_cache = torch.empty((128 * num_experts, hidden_size), dtype=torch.bfloat16, device=self.w13_weight.device) if _use_fbgemm_gpu else None
 
@@ -1397,7 +1397,8 @@ class DeepEPMoE(EPMoE):
 
         # GroupGemm-1
         down_output = fb_grouped_gemm(down_input, self.w2_weight_flatten, masked_m)
-        output = torch.zeros_like(hidden_states)
+        output = hidden_states  # Reuse hidden_states memory
+        output.zero_()  # Clear the reused memory
         run_fbgemm_postprocess_v2(down_output, indices, output)
         assert output.shape == torch.Size([num_groups, m, k])
 

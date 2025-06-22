@@ -1364,6 +1364,7 @@ def run_fbgemm_preprocess_v2(lhs: torch.Tensor, indices: torch.Tensor):
     Returns:
         output: [num_groups * m_max, k], same dtype as lhs, output[:total_m] is valid
     """
+    # TODO(cao1zhg): support output_tensor to avoid allocation, gather_along_first_dim does not support output_tensor currently
     num_groups, m_max, k = lhs.shape
 
     lhs = lhs.view(num_groups * m_max, k)
