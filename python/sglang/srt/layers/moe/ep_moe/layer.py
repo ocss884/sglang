@@ -26,21 +26,6 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     try_import_fbgemm_gpu,
 )
 
-_use_fbgemm_gpu = try_import_fbgemm_gpu()
-if _use_fbgemm_gpu:
-    logger.info(f"fbgemm_gpu is enabled, use forward_bf16_masked_v2")
-    from sglang.srt.layers.moe.ep_moe.kernels import (
-        compute_indices,
-        run_fbgemm_preprocess_v2,
-        run_fbgemm_postprocess_v2,
-    )
-else:
-    logger.info(f"fbgemm_gpu is disabled, use forward_bf16_masked_v1")
-    from sglang.srt.layers.moe.ep_moe.kernels import (
-        run_fbgemm_preprocess,
-        run_fbgemm_postprocess,
-    )
-
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE, FusedMoEMethodBase
 from sglang.srt.layers.moe.topk import select_experts
@@ -79,6 +64,20 @@ if _is_hip:
 
 logger = logging.getLogger(__name__)
 
+_use_fbgemm_gpu = try_import_fbgemm_gpu()
+if _use_fbgemm_gpu:
+    logger.info(f"fbgemm_gpu is enabled, use forward_bf16_masked_v2")
+    from sglang.srt.layers.moe.ep_moe.kernels import (
+        compute_indices,
+        run_fbgemm_preprocess_v2,
+        run_fbgemm_postprocess_v2,
+    )
+else:
+    logger.info(f"fbgemm_gpu is disabled, use forward_bf16_masked_v1")
+    from sglang.srt.layers.moe.ep_moe.kernels import (
+        run_fbgemm_preprocess,
+        run_fbgemm_postprocess,
+)
 
 class GroupedGemmRunner(torch.nn.Module):
     flashinfer_gemm_warpper = None
@@ -961,10 +960,6 @@ class DeepEPMoE(EPMoE):
             routed_scaling_factor=routed_scaling_factor,
         )
         self.deepep_mode = deepep_mode
-        if self.deepep_mode.enable_low_latency():
-            assert (
-                deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-            ), f"DeepEP {self.deepep_mode} mode requires deep_gemm"
         self.w13_weight_fp8 = (
             self.w13_weight,
             (
@@ -980,6 +975,7 @@ class DeepEPMoE(EPMoE):
         self.use_fb_grouped_gemm = use_fb_grouped_gemm
         self.w13_weight_flatten = self.w13_weight.view(-1, self.w13_weight.shape[-1])
         self.w2_weight_flatten = self.w2_weight.view(-1, self.w2_weight.shape[-1])
+        
         # TODO: num_max_dispatch_tokens_per_rank = 128, make it configurable
         self.intermediate_cache = torch.empty((128 * num_experts, hidden_size), dtype=torch.bfloat16, device=self.w13_weight.device) if _use_fbgemm_gpu else None
 
@@ -997,7 +993,7 @@ class DeepEPMoE(EPMoE):
     ):
         resolved_deepep_mode = self.deepep_mode.resolve(forward_mode)
         if resolved_deepep_mode == DeepEPMode.normal:
-            if isinstance(hidden_states, Tuple[torch.Tensor, torch.Tensor]):
+            if isinstance(hidden_states, tuple) and len(hidden_states) == 2:
                 assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
                 return self.forward_deepgemm_contiguous(
                     hidden_states, topk_idx, topk_weights, num_recv_tokens_per_expert
@@ -1007,7 +1003,7 @@ class DeepEPMoE(EPMoE):
             else:
                 raise ValueError(f"Invalid hidden_states type: {type(hidden_states)} in normal mode")
         elif resolved_deepep_mode == DeepEPMode.low_latency:
-            if isinstance(hidden_states, Tuple[torch.Tensor, torch.Tensor]):
+            if isinstance(hidden_states, tuple) and len(hidden_states) == 2:
                 assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
                 return self.forward_deepgemm_masked(hidden_states, masked_m, expected_m)
             elif isinstance(hidden_states, torch.Tensor):
@@ -1402,7 +1398,7 @@ class DeepEPMoE(EPMoE):
         # GroupGemm-1
         down_output = fb_grouped_gemm(down_input, self.w2_weight_flatten, masked_m)
         output = torch.zeros_like(hidden_states)
-        run_fbgemm_postprocess_v2(down_output, indices, output, masked_m)
+        run_fbgemm_postprocess_v2(down_output, indices, output)
         assert output.shape == torch.Size([num_groups, m, k])
 
         return output

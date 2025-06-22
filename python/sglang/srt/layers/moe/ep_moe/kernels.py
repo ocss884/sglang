@@ -1343,7 +1343,7 @@ def _compute_indices_kernel(
 def compute_indices(num_groups, m_max, m_sizes: torch.Tensor):
     offsets = torch.zeros_like(m_sizes, device=m_sizes.device)
     offsets[1:] = torch.cumsum(m_sizes[:-1], dim=0)
-    indices = torch.zeros(num_groups * m_max, device=m_sizes.device, dtype=torch.int64)
+    indices = torch.full([num_groups * m_max], num_groups * m_max - 1, device=m_sizes.device, dtype=torch.int64)
     grid = (num_groups,)
 
     _compute_indices_kernel[grid](
@@ -1359,10 +1359,10 @@ def run_fbgemm_preprocess_v2(lhs: torch.Tensor, indices: torch.Tensor):
     """
     Args:
         lhs: [num_groups, m_max, k], float32
-        indices: [total_m], int64
+        indices: [num_groups * m_max], int64, indices[:total_m] is valid and the rest is num_groups * m_max - 1
 
     Returns:
-        output: [total_m, k], same dtype as lhs
+        output: [num_groups * m_max, k], same dtype as lhs, output[:total_m] is valid
     """
     num_groups, m_max, k = lhs.shape
 
@@ -1370,6 +1370,7 @@ def run_fbgemm_preprocess_v2(lhs: torch.Tensor, indices: torch.Tensor):
 
     assert lhs.is_cuda, f"lhs not on CUDA: {lhs.device}"
     assert indices.is_cuda, f"indices not on CUDA: {indices.device}"
+    assert indices.dtype == torch.int64, f"indices dtype is not int64: {indices.dtype}"
     assert lhs.is_contiguous(), "lhs not contiguous"
     assert indices.is_contiguous(), "indices not contiguous"
 
@@ -1378,19 +1379,24 @@ def run_fbgemm_preprocess_v2(lhs: torch.Tensor, indices: torch.Tensor):
     return output
 
 
-def run_fbgemm_postprocess_v2(lhs: torch.Tensor, indices: torch.Tensor, output: torch.Tensor, m_sizes: torch.Tensor):
+def run_fbgemm_postprocess_v2(lhs: torch.Tensor, indices: torch.Tensor, output: torch.Tensor):
     """
     Args:
         output: [total_m, k]
-        indices: [total_m], int64
+        indices: [num_groups * m_max], int64, indices[:total_m] is valid and the rest is num_groups * m_max - 1
         output: [num_groups, m_max, k]
     """
 
     num_groups, m_max, k = output.shape
     output = output.view(num_groups * m_max, k)
 
-    indices = indices[:m_sizes.sum()]
-    lhs = lhs[:m_sizes.sum()]
+    assert lhs.is_cuda, f"lhs not on CUDA: {lhs.device}"
+    assert indices.is_cuda, f"indices not on CUDA: {indices.device}"
+    assert indices.dtype == torch.int64, f"indices dtype is not int64: {indices.dtype}"
+    assert output.is_cuda, f"output not on CUDA: {output.device}"
+    assert lhs.is_contiguous(), "lhs not contiguous"
+    assert indices.is_contiguous(), "indices not contiguous"
+    assert output.is_contiguous(), "output not contiguous"
 
     torch.ops.fbgemm.scatter_add_along_first_dim(output, lhs, indices)
 
