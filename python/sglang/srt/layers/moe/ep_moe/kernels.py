@@ -1237,7 +1237,7 @@ def run_fbgemm_preprocess(lhs: torch.Tensor, m_sizes: torch.Tensor, output: torc
         m_sizes: [num_groups], int32
 
     Returns:
-        output: [total_m, k], same dtype as lhs
+        output: [num_groups * m_max, k], same dtype as lhs, output[:total_m] is valid
     """
     num_groups, m_max, k = lhs.shape
     assert m_sizes.shape[0] == num_groups
