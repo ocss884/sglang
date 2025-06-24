@@ -34,6 +34,7 @@ from sglang.srt.utils import (
     is_remote_url,
     is_valid_ipv6_address,
     nullable_str,
+    find_interface_addr,
 )
 
 logger = logging.getLogger(__name__)
@@ -120,6 +121,7 @@ class ServerArgs:
 
     # Multi-node distributed serving
     dist_init_addr: Optional[str] = None
+    dist_init_socket_ifname: Optional[str] = None
     nnodes: int = 1
     node_rank: int = 0
 
@@ -1024,6 +1026,11 @@ class ServerArgs:
             help="The host address for initializing distributed backend (e.g., `192.168.0.2:25000`).",
         )
         parser.add_argument(
+            "--dist-init-socket-ifname",
+            type=str,
+            help="The name of the network interface to use for initializing distributed backend.",
+        )
+        parser.add_argument(
             "--nnodes", type=int, default=ServerArgs.nnodes, help="The number of nodes."
         )
         parser.add_argument(
@@ -1655,6 +1662,15 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
     ServerArgs.add_cli_args(parser)
     raw_args = parser.parse_args(argv)
     server_args = ServerArgs.from_cli_args(raw_args)
+    # override dist_init_addr by dist_init_socket_ifname
+    if server_args.dist_init_socket_ifname is not None and server_args.dist_init_addr is not None:
+        dist_init_addr_parts = server_args.dist_init_addr.split(":")
+        original_host = dist_init_addr_parts[0]
+        original_port = dist_init_addr_parts[1]
+        new_host = find_interface_addr(server_args.dist_init_socket_ifname)
+        if new_host is not None:
+            server_args.dist_init_addr = f"{new_host}:{original_port}"
+            print(f"server_args.dist_init_addr:{server_args.dist_init_addr:}")
     return server_args
 
 

@@ -40,6 +40,8 @@ import threading
 import time
 import traceback
 import warnings
+import fcntl
+import struct
 from contextlib import contextmanager
 from enum import Enum
 from functools import lru_cache
@@ -1816,6 +1818,20 @@ def set_uvicorn_logging_configs():
         "fmt"
     ] = '[%(asctime)s] %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
     LOGGING_CONFIG["formatters"]["access"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
+
+
+def find_interface_addr(ifname: str) -> str:
+    """Find the IP address of the given network interface."""
+    SIOCGIFADDR = 0x8915  # Standard ioctl for getting interface address
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            ifreq = struct.pack('16s', ifname.encode('utf-8')[:15])
+            ifreq += b'\x00' * (32 - len(ifreq))  # Pad to 32 bytes
+            result = fcntl.ioctl(s.fileno(), SIOCGIFADDR, ifreq)
+            ip_bytes = result[20:24]  # Extract 4-byte IPv4 address
+            return socket.inet_ntoa(ip_bytes)
+    except OSError:
+        return None
 
 
 def get_ip() -> str:
