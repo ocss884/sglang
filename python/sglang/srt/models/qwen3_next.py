@@ -883,9 +883,7 @@ class Qwen3NextModel(nn.Module):
 
 class HybridLayerType(enum.Enum):
     full_attention = "attention"
-    swa_attention = "swa_attention"
     linear_attention = "linear_attention"
-    mamba2 = "mamba"
 
 
 class Qwen3NextForCausalLM(nn.Module):
